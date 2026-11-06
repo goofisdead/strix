@@ -39,7 +39,7 @@ from openai.types.responses.response_usage import ResponseUsage
 from openai.types.shared import Reasoning
 
 from strix.agents.prompt import CACHE_POINT
-from strix.config import codex
+from strix.config import claude_proxy, claude_sub, codex
 from strix.config.loader import load_settings
 from strix.config.tool_call_arguments import repair_input
 from strix.config.tool_call_ids import TurnCallIdRewriter, dedupe_input
@@ -613,6 +613,7 @@ class StrixProvider(MultiProvider):
     def get_model(self, model_name: str | None) -> Model:
         llm = load_settings().llm
         slug = codex.subscription_model(model_name)
+        claude_slug = claude_sub.subscription_model(model_name)
         # The settings use 0 for no bound.
         idle_timeout = float(llm.stream_idle_timeout) or None
         first_event_timeout = float(llm.stream_first_event_timeout) or None
@@ -631,6 +632,28 @@ class StrixProvider(MultiProvider):
                 provider="openai-codex",
                 base_url=None,
             )
+        elif claude_slug:
+            # Claude Pro/Max subscription. Route through the local OAuth proxy
+            # so LiteLLM's anthropic path works unchanged.
+            proxy_url = claude_proxy.start()
+            from agents.extensions.models.litellm_model import LitellmModel
+
+            inner: Model = LitellmModel(
+                model=f"anthropic/{claude_slug}",
+                api_key="claude-code-oauth",
+                base_url=proxy_url,
+            )
+            model = request_log.RequestLoggingModel(
+                inner,
+                model_name=claude_slug,
+                provider="anthropic-claude-sub",
+                base_url=proxy_url,
+                route="litellm",
+                abandoned_only=True,
+            )
+            if llm.disable_streaming:
+                model = _NonStreamingModel(model)
+                idle_timeout = first_event_timeout = total_timeout = None
         else:
             model = super().get_model(model_name)
             resolved_name = model_name or llm.model or "unknown"
@@ -714,6 +737,16 @@ def configure_sdk_model_defaults(settings: Settings) -> None:
         return
     _configure_litellm_compatibility()
     _configure_attribution(llm.model)
+    if claude_sub.subscription_model(llm.model):
+        # Point LiteLLM's anthropic route at the local OAuth-signing proxy.
+        # The placeholder api_key is overwritten by the proxy before upstream.
+        proxy_url = claude_proxy.start()
+        _configure_litellm_default("api_base", proxy_url)
+        _configure_litellm_default("api_key", "claude-code-oauth")
+        os.environ.setdefault("ANTHROPIC_API_BASE", proxy_url)
+        os.environ.setdefault("ANTHROPIC_API_KEY", "claude-code-oauth")
+        _configure_extra_headers(llm)
+        return
     if llm.api_key:
         set_default_openai_key(llm.api_key, use_for_tracing=False)
         _configure_litellm_default("api_key", llm.api_key)
@@ -986,6 +1019,9 @@ def uses_chat_completions_tool_schema(model_name: str, settings: Settings) -> bo
     """Return whether the resolved SDK route can only receive JSON function tools."""
     if codex.subscription_model(model_name):
         return False
+    if claude_sub.subscription_model(model_name):
+        # Routed through LiteLLM's anthropic path.
+        return True
     model = model_name.strip().lower()
     if "/" in model and not model.startswith("openai/"):
         return True
@@ -1063,6 +1099,8 @@ def routes_through_litellm(model_name: str | None) -> bool:
     name = (model_name or "").strip()
     if not name or codex.subscription_model(name):
         return False
+    if claude_sub.subscription_model(name):
+        return True
     prefix, _, rest = name.partition("/")
     return bool(rest) and prefix.lower() not in {"openai", "any-llm"}
 

@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import IntegrationSettings, codex, load_settings
+from strix.config import IntegrationSettings, claude_sub, codex, load_settings
 from strix.interface.utils import (
     check_docker_connection,
     image_exists,
@@ -48,6 +48,22 @@ def validate_environment() -> None:
             report_error("subscription_not_signed_in")
             sys.exit(1)
         logger.info("Environment OK (ChatGPT subscription)")
+        return
+
+    if claude_sub.subscription_model(settings.llm.model):
+        if not claude_sub.is_authenticated():
+            console.print(
+                f"[red]STRIX_LLM={settings.llm.model} uses your Claude subscription, "
+                "but no credentials were found.[/] Run [cyan]strix auth login claude[/] "
+                "or sign in with Claude Code (`claude /login`) and rerun."
+            )
+            report_error("subscription_not_signed_in")
+            sys.exit(1)
+        source = claude_sub.external_source_summary()
+        if source is not None:
+            logger.info("Environment OK (Claude subscription, source=%s)", source)
+        else:
+            logger.info("Environment OK (Claude subscription)")
         return
 
     if not settings.llm.model:

@@ -15,7 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings, persist_current
+from strix.config import claude_sub, codex, load_settings, persist_current
 from strix.core.paths import RUNS_DIR_NAME, run_dir_for
 from strix.interface.cli_args import (
     FAIL_ON_SEVERITIES,
@@ -86,24 +86,48 @@ def _exception_messages(exc: BaseException) -> tuple[str, ...]:
 
 
 def _subscription_error_hint(exc: BaseException) -> str | None:
-    """Return an actionable hint for a known ChatGPT-subscription error, or None."""
-    if not codex.subscription_model(load_settings().llm.model):
-        return None
+    """Return an actionable hint for a known subscription error, or None."""
+    model = load_settings().llm.model
     joined = " ".join(_exception_messages(exc)).lower()
+    auth_401 = (
+        "error code: 401" in joined
+        or "http 401" in joined
+        or "unauthorized" in joined
+        or "invalid_grant" in joined
+    )
+    if codex.subscription_model(model):
+        return _chatgpt_sub_hint(joined, auth_401)
+    if claude_sub.subscription_model(model):
+        return _claude_sub_hint(joined, auth_401)
+    return None
+
+
+def _chatgpt_sub_hint(joined: str, auth_401: bool) -> str | None:
     if "not supported when using codex with a chatgpt account" in joined:
         return (
             "This model isn't available on your ChatGPT subscription. "
             "Set STRIX_LLM to a model your plan includes (e.g. chatgpt/gpt-5.4)."
         )
-    if (
-        "error code: 401" in joined
-        or "http 401" in joined
-        or "unauthorized" in joined
-        or "invalid_grant" in joined
-    ):
+    if auth_401:
         return (
             "Your ChatGPT sign-in has expired or was revoked. Sign in again:\n"
             "  strix auth login chatgpt"
+        )
+    return None
+
+
+def _claude_sub_hint(joined: str, auth_401: bool) -> str | None:
+    if auth_401 or "oauth" in joined:
+        return (
+            "Your Claude sign-in has expired or was rejected. Sign in again:\n"
+            "  strix auth login claude\n"
+            "Or run `claude /login` in Claude Code to refresh its credentials."
+        )
+    if "model" in joined and ("not found" in joined or "unknown" in joined):
+        return (
+            "This model isn't available on your Claude subscription. "
+            "Set STRIX_LLM to a model your plan includes "
+            "(e.g. claude-code/claude-opus-4-5-20250929)."
         )
     return None
 
