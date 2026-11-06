@@ -1,8 +1,14 @@
-"""`strix auth` — ChatGPT subscription sign-in (login / status / logout).
+"""`strix auth` — subscription sign-in (login / status / logout).
+
+Two providers are supported:
+
+- ``chatgpt`` — OpenAI's Codex OAuth flow; runs on a ChatGPT Plus/Pro plan.
+- ``claude`` — Anthropic's Claude Code OAuth flow; runs on a Claude Pro/Max plan
+  (also picks up any existing Claude Code / OpenCode credentials).
 
 Signing in only stores OAuth tokens (``~/.strix/subscription-auth.json``); model
-selection stays with ``STRIX_LLM``. A ``chatgpt/<model>`` STRIX_LLM runs on the
-subscription.
+selection stays with ``STRIX_LLM``. ``chatgpt/<model>`` runs on ChatGPT;
+``claude-code/<model>`` runs on Claude.
 """
 
 from __future__ import annotations
@@ -21,7 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from strix.config import codex, load_settings
+from strix.config import claude_sub, codex, load_settings
 
 
 if TYPE_CHECKING:
@@ -32,13 +38,22 @@ logger = logging.getLogger(__name__)
 
 _CALLBACK_TIMEOUT_S = 300
 
-# CLI-facing name for the login provider. Internally this is the Codex OAuth
-# flow (``codex.PROVIDER``), but users know it as ChatGPT, so that's what the
-# command and messaging say. ``codex`` is accepted as an alias.
+# CLI-facing names for the two subscription providers.
 LOGIN_PROVIDER = "chatgpt"
-_ACCEPTED_PROVIDERS = frozenset({LOGIN_PROVIDER, codex.PROVIDER})
+CLAUDE_LOGIN_PROVIDER = "claude"
+_CHATGPT_PROVIDERS = frozenset({LOGIN_PROVIDER, codex.PROVIDER})
+_CLAUDE_PROVIDERS = frozenset(
+    {CLAUDE_LOGIN_PROVIDER, "claude-code", "claude-max", claude_sub.PROVIDER},
+)
+_ACCEPTED_PROVIDERS = _CHATGPT_PROVIDERS | _CLAUDE_PROVIDERS
 
-_USAGE = "Usage:\n  strix auth login chatgpt [--manual]\n  strix auth status\n  strix auth logout"
+_USAGE = (
+    "Usage:\n"
+    "  strix auth login chatgpt [--manual]\n"
+    "  strix auth login claude  [--manual]\n"
+    "  strix auth status\n"
+    "  strix auth logout [chatgpt|claude]"
+)
 
 
 def run_auth(argv: list[str]) -> int:
@@ -55,7 +70,7 @@ def run_auth(argv: list[str]) -> int:
     handlers: dict[str, Callable[[], int]] = {
         "login": lambda: _login(console, rest),
         "status": lambda: _status(console),
-        "logout": lambda: _logout(console),
+        "logout": lambda: _logout(console, rest),
     }
     handler = handlers.get(subcommand)
     if handler is not None:
@@ -72,7 +87,7 @@ def _login(console: Console, argv: list[str]) -> int:
         "provider",
         nargs="?",
         default=LOGIN_PROVIDER,
-        help="Model provider to sign in with (default: chatgpt).",
+        help="Subscription provider to sign in with (chatgpt or claude; default: chatgpt).",
     )
     parser.add_argument(
         "--manual",
@@ -84,10 +99,13 @@ def _login(console: Console, argv: list[str]) -> int:
     except SystemExit as exc:  # argparse already printed the message
         return int(exc.code or 2)
 
-    if args.provider.lower() not in _ACCEPTED_PROVIDERS:
+    provider_lower = args.provider.lower()
+    if provider_lower in _CLAUDE_PROVIDERS:
+        return _login_claude(console, manual=args.manual)
+    if provider_lower not in _CHATGPT_PROVIDERS:
         console.print(
             f"[red]Unsupported provider:[/] {args.provider}. "
-            f"Only '{LOGIN_PROVIDER}' (ChatGPT subscription) is supported."
+            f"Choose '{LOGIN_PROVIDER}' or '{CLAUDE_LOGIN_PROVIDER}'."
         )
         return 2
 
@@ -113,6 +131,179 @@ def _login(console: Console, argv: list[str]) -> int:
     codex.save_record(record)
     _print_success(console)
     return 0
+
+
+def _login_claude(console: Console, *, manual: bool) -> int:
+    """Run the Claude Pro/Max OAuth flow and persist the record."""
+    verifier, challenge = claude_sub.generate_pkce()
+    state = claude_sub.create_state()
+    authorize_url = claude_sub.build_authorize_url(challenge, state, manual=manual)
+
+    console.print()
+    console.print("[bold]Signing in with Claude[/] [dim](provider: claude)[/]")
+    console.print(
+        "[dim]This uses your Claude Pro/Max subscription for inference instead of an API key.[/]"
+    )
+    external = claude_sub.external_source_summary()
+    if external is not None:
+        console.print(
+            f"[dim]Tip: strix can already read credentials from {external}. "
+            "Sign in only if you want strix to own its own token.[/]"
+        )
+    console.print()
+
+    try:
+        code, returned_state = _run_claude_oauth_flow(
+            console, authorize_url, state, manual=manual
+        )
+    except claude_sub.ClaudeAuthError as exc:
+        return _fail_claude(console, exc)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Sign-in cancelled.[/]")
+        return 130
+
+    if returned_state is not None and returned_state != state:
+        return _fail_claude(
+            console,
+            claude_sub.ClaudeAuthError("state_mismatch", "state did not match; possible CSRF"),
+        )
+
+    try:
+        record = claude_sub.exchange_code(code, verifier, state, manual=manual)
+    except claude_sub.ClaudeAuthError as exc:
+        return _fail_claude(console, exc)
+
+    claude_sub.save_record(record)
+    _print_claude_success(console)
+    return 0
+
+
+def _run_claude_oauth_flow(
+    console: Console,
+    authorize_url: str,
+    state: str,  # noqa: ARG001 - carried by caller for validation
+    *,
+    manual: bool,
+) -> tuple[str, str | None]:
+    """Drive the browser (or manual) Claude OAuth flow and return ``(code, state)``."""
+    server = None if manual else _try_start_claude_callback_server()
+
+    console.print("Open this URL in your browser to authorize:")
+    console.print(f"[cyan]{authorize_url}[/]")
+    console.print()
+    if not manual:
+        try:
+            webbrowser.open(authorize_url)
+        except Exception:  # noqa: BLE001 - opening a browser is best-effort
+            logger.debug("could not open browser", exc_info=True)
+
+    if server is not None:
+        console.print("[dim]Waiting for you to finish signing in…[/]")
+        result = server.wait(_CALLBACK_TIMEOUT_S)
+        server.shutdown()
+        if result is not None:
+            code, returned_state, error = result
+            if error:
+                raise claude_sub.ClaudeAuthError("oauth_error", error)
+            if not code:
+                raise claude_sub.ClaudeAuthError(
+                    "no_code", "no authorization code found in the callback"
+                )
+            return code, returned_state
+        console.print("[yellow]Timed out waiting for the browser. Falling back to manual paste.[/]")
+
+    console.print()
+    try:
+        pasted = console.input(
+            "Paste the full redirect URL (or the code#state value shown on the Anthropic page): "
+        ).strip()
+    except EOFError as exc:
+        raise claude_sub.ClaudeAuthError("no_input", "no redirect URL provided") from exc
+    code, returned_state = claude_sub.parse_redirect_input(pasted)
+    if not code:
+        raise claude_sub.ClaudeAuthError("no_code", "no authorization code found in the redirect")
+    return code, returned_state
+
+
+def _try_start_claude_callback_server() -> _CallbackServer | None:
+    event = threading.Event()
+    holder: dict[str, Any] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: Any) -> None:  # silence default stderr logging
+            pass
+
+        def do_GET(self) -> None:
+            parsed = urlparse(self.path)
+            if parsed.path != claude_sub.CALLBACK_PATH:
+                self.send_response(404)
+                self.end_headers()
+                return
+            query = parse_qs(parsed.query)
+            holder["code"] = _first(query, "code")
+            holder["state"] = _first(query, "state")
+            holder["error"] = _first(query, "error_description") or _first(query, "error")
+            body = _render_callback_html("Claude").encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            event.set()
+
+    try:
+        httpd = HTTPServer(("127.0.0.1", claude_sub.CALLBACK_PORT), Handler)
+    except OSError:
+        logger.debug(
+            "could not bind claude callback port %d", claude_sub.CALLBACK_PORT, exc_info=True
+        )
+        return None
+    return _CallbackServer(httpd, event, holder)
+
+
+def _fail_claude(console: Console, exc: claude_sub.ClaudeAuthError) -> int:
+    error_text = Text()
+    error_text.append("SIGN-IN FAILED", style="bold red")
+    error_text.append("\n\n", style="white")
+    error_text.append(f"{exc}", style="white")
+    console.print()
+    console.print(
+        Panel(
+            error_text,
+            title="[bold white]STRIX",
+            title_align="left",
+            border_style="red",
+            padding=(1, 2),
+        )
+    )
+    return 1
+
+
+def _print_claude_success(console: Console) -> None:
+    text = Text()
+    text.append("Signed in with your Claude subscription", style="bold #22c55e")
+    text.append("\n\n", style="white")
+    text.append("Set ", style="white")
+    text.append("STRIX_LLM", style="bold white")
+    text.append(" to a ", style="white")
+    text.append("claude-code/", style="bold cyan")
+    text.append(" model (e.g. ", style="white")
+    text.append("claude-code/claude-opus-4-5-20250929", style="bold cyan")
+    text.append(") — runs are billed to your Claude plan.", style="white")
+    text.append("\n\n", style="white")
+    text.append("Run a scan as usual, e.g. ", style="white")
+    text.append("strix --target https://example.com", style="bold cyan")
+    console.print()
+    console.print(
+        Panel(
+            text,
+            title="[bold white]STRIX",
+            title_align="left",
+            border_style="#22c55e",
+            padding=(1, 2),
+        )
+    )
+    console.print()
 
 
 def _run_oauth_flow(
@@ -221,7 +412,7 @@ def _try_start_callback_server() -> _CallbackServer | None:
             holder["code"] = _first(query, "code")
             holder["state"] = _first(query, "state")
             holder["error"] = _first(query, "error_description") or _first(query, "error")
-            body = _render_callback_html().encode("utf-8")
+            body = _render_callback_html("ChatGPT").encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -243,25 +434,62 @@ def _first(query: dict[str, list[str]], key: str) -> str | None:
 
 
 def _status(console: Console) -> int:
-    record = codex.read_record()
-    if record is None:
-        console.print("[yellow]Not signed in.[/] Run [cyan]strix auth login chatgpt[/] to sign in.")
-        return 1
+    chatgpt = codex.read_record()
+    claude = claude_sub.read_record()
     settings = load_settings()
-    console.print("[green]Signed in[/] with a ChatGPT subscription.")
-    console.print(f"  Account: [bold]{record.get('account_id')}[/]")
-    if codex.subscription_model(settings.llm.model):
-        console.print(f"  Runs use the subscription (STRIX_LLM=[bold]{settings.llm.model}[/]).")
-    else:
+
+    if chatgpt is None and claude is None:
         console.print(
-            "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. [cyan]chatgpt/gpt-5.4[/] "
-            "to run on the subscription."
+            "[yellow]Not signed in.[/] Run [cyan]strix auth login chatgpt[/] or "
+            "[cyan]strix auth login claude[/] to sign in."
+        )
+        return 1
+
+    if chatgpt is not None:
+        console.print("[green]Signed in[/] with a ChatGPT subscription.")
+        console.print(f"  Account: [bold]{chatgpt.get('account_id')}[/]")
+        if codex.subscription_model(settings.llm.model):
+            console.print(
+                f"  Runs use ChatGPT (STRIX_LLM=[bold]{settings.llm.model}[/])."
+            )
+
+    if claude is not None:
+        console.print("[green]Signed in[/] with a Claude subscription.")
+        source = claude.get("source") or "strix"
+        if source != "strix":
+            console.print(f"  Source: [bold]{source}[/] ({claude.get('source_path') or '?'})")
+        scopes = ", ".join(claude_sub.scopes_from_record(claude)) or "(not reported)"
+        console.print(f"  Scopes: [dim]{scopes}[/]")
+        if claude_sub.subscription_model(settings.llm.model):
+            console.print(
+                f"  Runs use Claude (STRIX_LLM=[bold]{settings.llm.model}[/])."
+            )
+
+    picked = codex.subscription_model(settings.llm.model) or claude_sub.subscription_model(
+        settings.llm.model
+    )
+    if picked is None:
+        console.print(
+            "  [yellow]Note:[/] set [cyan]STRIX_LLM[/] to e.g. "
+            "[cyan]chatgpt/gpt-5.4[/] or [cyan]claude-code/claude-opus-4-5-20250929[/] "
+            "to run on a subscription."
         )
     return 0
 
 
-def _logout(console: Console) -> int:
-    codex.logout()
+def _logout(console: Console, argv: list[str]) -> int:
+    """`strix auth logout [chatgpt|claude]` — scoped sign-out; default forgets both."""
+    target = (argv[0].lower() if argv else "").strip()
+    if target and target not in _ACCEPTED_PROVIDERS:
+        console.print(
+            f"[red]Unknown provider:[/] {target}. "
+            f"Choose '{LOGIN_PROVIDER}' or '{CLAUDE_LOGIN_PROVIDER}'."
+        )
+        return 2
+    if not target or target in _CHATGPT_PROVIDERS:
+        codex.logout()
+    if not target or target in _CLAUDE_PROVIDERS:
+        claude_sub.logout()
     console.print("[green]Signed out.[/] Stored subscription credentials removed.")
     return 0
 
@@ -315,12 +543,6 @@ _LOGO_PATH = Path(__file__).resolve().parent.parent / "viewer" / "static" / "log
 
 
 def _logo_img_tag() -> str:
-    """Return an ``<img>`` for the Strix logo as an inline data URI, or "".
-
-    The callback page is served offline by the local OAuth server, so the logo
-    is embedded rather than linked. Missing/unreadable file degrades to just the
-    "Strix" wordmark.
-    """
     try:
         data = _LOGO_PATH.read_bytes()
     except OSError:
@@ -329,8 +551,10 @@ def _logo_img_tag() -> str:
     return f'<img class="logo" src="data:image/png;base64,{encoded}" alt="" />'
 
 
-def _render_callback_html() -> str:
-    return _CALLBACK_HTML.replace("<!--LOGO-->", _logo_img_tag())
+def _render_callback_html(provider_label: str = "ChatGPT") -> str:
+    return _CALLBACK_HTML.replace("<!--LOGO-->", _logo_img_tag()).replace(
+        "<!--PROVIDER-->", provider_label
+    )
 
 
 _CALLBACK_HTML = """<!doctype html>
@@ -399,7 +623,7 @@ _CALLBACK_HTML = """<!doctype html>
   <h1>You're signed in</h1>
   <main class="card">
     <div class="badge">✓</div>
-    <p class="msg">Strix is connected to your ChatGPT subscription. Head back to your
+    <p class="msg">Strix is connected to your <!--PROVIDER--> subscription. Head back to your
       terminal — your security test runs there.</p>
     <div class="rule"></div>
     <p class="tagline">Autonomous AI hackers that <b>find and fix</b> your app's
