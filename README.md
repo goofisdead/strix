@@ -324,7 +324,7 @@ strix auth status                    # show the active sign-in, or logout to for
 Same idea for a Claude Pro/Max plan. Strix will reuse whatever creds Claude Code
 or OpenCode already have on disk (`~/.claude/.credentials.json`,
 `~/.config/opencode/auth.json`, `~/.local/share/opencode/auth.json`), so if you
-are already signed into those CLIs there is nothing to do — just set the model:
+are already signed into those CLIs there is nothing to do. Just set the model:
 
 ```bash
 export STRIX_LLM="claude-code/claude-opus-4-5-20250929"

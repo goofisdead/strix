@@ -141,7 +141,7 @@ def main() -> int:
     assert body_fwd["system"].startswith(claude_sub.CLAUDE_CODE_SYSTEM_IDENTIFIER)
     assert "You are a helpful penetration tester." in body_fwd["system"]
 
-    # Streaming request — path tweaked so the fake switches to SSE.
+    # Streaming request: path tweaked so the fake switches to SSE.
     claude_proxy._UPSTREAM = f"http://127.0.0.1:{upstream_port}/v1/messages/stream"
     req = urllib.request.Request(
         f"{base}/v1/messages",
@@ -159,7 +159,7 @@ def main() -> int:
         payload = resp.read().decode()
     assert "message_start" in payload and "message_stop" in payload, payload
 
-    # List-shaped system prompt — identifier should prepend as a block.
+    # List-shaped system prompt: identifier should prepend as a block.
     claude_proxy._UPSTREAM = f"http://127.0.0.1:{upstream_port}/v1/messages"
     captured.clear()
     req = urllib.request.Request(
