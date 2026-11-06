@@ -319,6 +319,31 @@ export STRIX_LLM="chatgpt/gpt-5.4"   # chatgpt/<model> runs on the subscription
 strix auth status                    # show the active sign-in, or logout to forget it
 ```
 
+#### Sign in with a Claude subscription (Claude Code / OpenCode)
+
+Same idea for a Claude Pro/Max plan. Strix will reuse whatever creds Claude Code
+or OpenCode already have on disk (`~/.claude/.credentials.json`,
+`~/.config/opencode/auth.json`, `~/.local/share/opencode/auth.json`), so if you
+are already signed into those CLIs there is nothing to do — just set the model:
+
+```bash
+export STRIX_LLM="claude-code/claude-opus-4-5-20250929"
+strix --target ./app-directory
+```
+
+If neither CLI is installed, sign in with Strix directly:
+
+```bash
+strix auth login claude                                   # opens claude.ai
+export STRIX_LLM="claude-code/claude-sonnet-4-5-20250929"
+strix auth status                                         # or logout claude
+```
+
+Under the hood, Strix starts a local `127.0.0.1` proxy that stamps a fresh
+OAuth bearer on each request and forwards to `api.anthropic.com`, so LiteLLM's
+anthropic path works unchanged. On WSL, point at a Windows profile with
+`STRIX_WINDOWS_PROFILE=/mnt/c/Users/<you>` to read its Claude Code creds.
+
 #### Use the managed platform: `strix cloud`
 
 Run scans on [app.strix.ai](https://app.strix.ai) from the terminal, without Docker or an LLM key:

@@ -25,12 +25,20 @@ Target-specific workflows built on the same engine:
 
 **Two ways to run, same engine — pick per situation:**
 
-- **Open-source CLI (self-hosted):** free, fully local, BYO LLM key, needs Docker. Best for local dev loops, air-gapped/offline, and full control.
+- **Open-source CLI (self-hosted):** free, fully local, BYO LLM key or a subscription sign-in, needs Docker. Best for local dev loops, air-gapped/offline, and full control.
   ```bash
   curl -sSL https://strix.ai/install | bash        # install
   export STRIX_LLM="openrouter/z-ai/glm-5.3"        # any LiteLLM model id, or vercel_ai_gateway/zai/glm-5.3
   export LLM_API_KEY="<key>"
   strix -n -t ./ --scan-mode quick --max-budget 10  # headless scan; always use -n
+  ```
+  No API key? Sign in with a subscription instead:
+  ```bash
+  strix auth login chatgpt                                  # ChatGPT Plus/Pro
+  export STRIX_LLM="chatgpt/gpt-5.4"
+  # or
+  strix auth login claude                                   # Claude Pro/Max
+  export STRIX_LLM="claude-code/claude-opus-4-5-20250929"   # auto-reads Claude Code / OpenCode creds too
   ```
   - Requires Docker running. Scans take minutes (`quick`) to hours (`deep`) — run in the background.
   - Exit codes (headless): `0` clean, `1` fatal error, `2` vulnerabilities found. A `0` only covers what was analyzed — check `run.json` (`status`, `llm_usage.cost` vs the budget) before calling a run clean.
